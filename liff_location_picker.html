@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0">
+    <title>Get Location</title>
+    <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+    <style>
+        body { font-family: sans-serif; text-align: center; padding: 20px; }
+        #status { margin-top: 20px; font-size: 1.2em; color: #333; }
+        #error { color: red; margin-top: 10px; }
+        button { padding: 10px 20px; font-size: 1em; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>กำลังดึงตำแหน่ง...</h1>
+    <p id="status">กรุณารอสักครู่</p>
+    <p id="error"></p>
+    <button id="getLocationBtn" style="display:none;">ลองอีกครั้ง</button>
+
+    <script>
+        function getQueryParam(name) {
+            const url = new URL(window.location.href);
+            return url.searchParams.get(name) || "";
+        }
+
+        async function initializeLiff() {
+            try {
+                await liff.init({ liffId: "YOUR_LIFF_ID" }); // TODO: แทนที่ด้วย LIFF ID จริงของคุณ
+                if (!liff.isLoggedIn()) {
+                    liff.login();
+                } else {
+                    getLocation();
+                }
+            } catch (err) {
+                document.getElementById('status').innerText = 'เกิดข้อผิดพลาดในการเริ่มต้น LIFF';
+                document.getElementById('error').innerText = err.message;
+                document.getElementById('getLocationBtn').style.display = 'block';
+                console.error('LIFF initialization failed', err);
+            }
+        }
+
+        function getLocation() {
+            const txn = getQueryParam('txn'); // transaction id จาก URL
+
+            document.getElementById('status').innerText = 'กำลังดึงตำแหน่ง GPS...';
+            document.getElementById('error').innerText = '';
+            document.getElementById('getLocationBtn').style.display = 'none';
+
+            if (!navigator.geolocation) {
+                document.getElementById('status').innerText = 'เบราว์เซอร์ไม่รองรับ Geolocation';
+                document.getElementById('error').innerText = 'กรุณาใช้เบราว์เซอร์ที่รองรับ';
+                return;
+            }
+
+            navigator.geolocation.getCurrentPosition(
+                async (position) => {
+                    const lat = position.coords.latitude;
+                    const lon = position.coords.longitude;
+                    const accuracy = Math.round(position.coords.accuracy || 0);
+                    const ts = Date.now(); // timestamp (ms)
+
+                    document.getElementById('status').innerText = `ได้ตำแหน่งแล้ว: Lat ${lat}, Lon ${lon}`;
+
+                    try {
+                        const meta = `txn=${txn}|acc=${accuracy}|ts=${ts}`; // ฝังข้อมูลกันทุจริต
+                        await liff.sendMessages([
+                            {
+                                type: 'location',
+                                title: 'ตำแหน่งเช็คอิน',
+                                address: `Lat:${lat}, Lon:${lon} (${meta})`,
+                                latitude: lat,
+                                longitude: lon
+                            }
+                        ]);
+                        liff.closeWindow();
+                    } catch (err) {
+                        document.getElementById('status').innerText = 'เกิดข้อผิดพลาดในการส่งข้อความ';
+                        document.getElementById('error').innerText = err.message;
+                        document.getElementById('getLocationBtn').style.display = 'block';
+                        console.error('Error sending message', err);
+                    }
+                },
+                (error) => {
+                    let errorMessage = 'ไม่สามารถดึงตำแหน่งได้';
+                    switch(error.code) {
+                        case error.PERMISSION_DENIED:
+                            errorMessage = 'คุณปฏิเสธการเข้าถึงตำแหน่ง กรุณาอนุญาตในตั้งค่าอุปกรณ์';
+                            break;
+                        case error.POSITION_UNAVAILABLE:
+                            errorMessage = 'ข้อมูลตำแหน่งไม่พร้อมใช้งาน';
+                            break;
+                        case error.TIMEOUT:
+                            errorMessage = 'หมดเวลาในการดึงตำแหน่ง';
+                            break;
+                        default:
+                            errorMessage = 'เกิดข้อผิดพลาดที่ไม่ทราบสาเหตุ';
+                            break;
+                    }
+                    document.getElementById('status').innerText = errorMessage;
+                    document.getElementById('error').innerText = `Code: ${error.code}, Message: ${error.message}`;
+                    document.getElementById('getLocationBtn').style.display = 'block';
+                    console.error('Geolocation error', error);
+                },
+                { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+            );
+        }
+
+        document.getElementById('getLocationBtn').addEventListener('click', getLocation);
+        window.onload = initializeLiff;
+    </script>
+</body>
+</html>
