@@ -1641,6 +1641,7 @@ def handle_message(event):
         return
     if evt_id:
         _processed_events.add(evt_id)
+
     text = event.message.text.strip()
 
     print(f"DEBUG: User ID: {user_id}")
@@ -1780,6 +1781,14 @@ def handle_message(event):
     finish_words_checkin = ("จบ", "จบการเช็คอิน", "จบเช็คอิน", "yes", "y", "done", "finish", "เสร็จแล้ว", "จบลงทะเบียน")
     finish_words_submit  = ("จบ", "จบการส่งงาน", "yes", "y", "done", "finish", "ส่งงานเสร็จ", "เสร็จแล้ว")
 
+    # --- ปิดการส่งงานด้วยข้อความ (ยืดหยุ่น/ทนต่อคำสะกดที่หลากหลาย) ---
+    if current_state == "waiting_for_submit_images" and current_transaction_id and _is_finish_submit_text(text):
+        _finalize_submission(user_id, current_transaction_id, "done")
+        _reply_or_push_messages(event, user_id, [V3TextMessage(text="ส่งงานเรียบร้อย ✅ บันทึกภาพครบแล้ว")])
+        print(f"DEBUG: User finished submission via text. transaction_id={current_transaction_id}")
+        sys.stdout.flush()
+        return
+
     if current_state == "waiting_for_checkin_images" and current_transaction_id and _is_finish_checkin_text(text):
         _finalize_checkin(user_id, current_transaction_id, "done", reply_token=event.reply_token, send_summary=True)
         print(f"DEBUG: User finished early via quick menu. transaction_id={current_transaction_id}")
@@ -1836,7 +1845,7 @@ def handle_location_message(event):
 
     evt_id = getattr(event, "webhook_event_id", None) or getattr(event.message, "id", None)
     if evt_id and evt_id in _processed_events:
-        print(f"DEBUG: Duplicate image event ignored: {evt_id}")
+        print(f"DEBUG: Duplicate location event ignored: {evt_id}")
         sys.stdout.flush()
         return
     if evt_id:
@@ -1986,179 +1995,213 @@ def handle_location_message(event):
         )
     )
 
-# @handler.add(MessageEvent, message=ImageMessageContent)  # DISABLED duplicate handler (old, pre FR-005)
-def _handle_image_message_old_1(event):
+@handler.add(MessageEvent, message=ImageMessageContent)
+def handle_image_message(event):
+    # Ensure services are ready
     ensure_google_services()
 
     user_id = event.source.user_id
 
-    # อ่านสถานะพนักงานก่อน
+    # ---- De-dup guard: avoid double-processing when LINE retries/redelivers ----
+    evt_id = getattr(event, "webhook_event_id", None) or getattr(event.message, "id", None)
+    if evt_id and evt_id in _processed_events:
+        print(f"DEBUG: Duplicate image event ignored: {evt_id}")
+        sys.stdout.flush()
+        return
+    if evt_id:
+        _processed_events.add(evt_id)
+
+    # ---- Load employee context once ----
     employee_data, _ = get_employee_data(user_id)
     if employee_data == "__SHEETS_ERROR__":
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="ระบบชีตช้าชั่วคราว ลองส่งรูปอีกครั้งภายหลังครับ")]
-            )
-        )
+        _reply_or_push_messages(event, user_id, [
+            V3TextMessage(text="ตอนนี้เชื่อมต่อชีตไม่สำเร็จ กรุณาส่งรูปอีกครั้งภายหลังสักครู่")
+        ])
+        print("DEBUG: Image path aborted due to Sheets error."); sys.stdout.flush()
         return
+
     if not employee_data:
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="ยังไม่ได้ลงทะเบียน ไม่สามารถใช้งานได้ครับ")]
-            )
-        )
+        _reply_or_push_messages(event, user_id, [
+            V3TextMessage(text="กรุณาลงทะเบียนก่อนใช้งานฟังก์ชันนี้")
+        ])
+        print("DEBUG: Replied: not registered (Image)."); sys.stdout.flush()
         return
 
-    state = employee_data[EMPLOYEE_CURRENT_STATE_COL] if len(employee_data) > EMPLOYEE_CURRENT_STATE_COL else "idle"
-    txn   = employee_data[EMPLOYEE_CURRENT_TRANSACTION_ID_COL] if len(employee_data) > EMPLOYEE_CURRENT_TRANSACTION_ID_COL else ""
+    current_state = employee_data[EMPLOYEE_CURRENT_STATE_COL] if len(employee_data) > EMPLOYEE_CURRENT_STATE_COL else "idle"
+    current_transaction_id = employee_data[EMPLOYEE_CURRENT_TRANSACTION_ID_COL] if len(employee_data) > EMPLOYEE_CURRENT_TRANSACTION_ID_COL else ""
 
-    # อนุญาตเฉพาะตอนรอรูป (เช็คอิน/ส่งงาน)
-    if state not in ("waiting_for_checkin_images", "waiting_for_submit_images") or not txn:
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="ยังไม่ได้เข้าสู่ขั้นตอนส่งรูปครับ")]
-            )
-        )
+    # ---- Pre-check timeout on event path ----
+    if _check_and_handle_timeout(user_id, reply_token=event.reply_token):
         return
 
-    # ดึง binary ของรูปจาก LINE
+    # ---- Validate state ----
+    if current_state not in ("waiting_for_checkin_images", "waiting_for_submit_images") or not current_transaction_id:
+        _reply_or_push_messages(event, user_id, [
+            V3TextMessage(text="กรุณาเริ่มขั้นตอนให้ถูกต้องก่อน (เช็คอินหรือส่งงาน) แล้วจึงส่งรูปครับ")
+        ])
+        print("DEBUG: Replied: image received but not in waiting-for-images state."); sys.stdout.flush()
+        return
+
+    # ---- Download image bytes from LINE ----
     try:
-        content = blob_api.get_message_content(message_id=event.message.id)
-        data = content.read()  # bytes
-    except Exception as e:
-        print(f"WARNING: cannot get image content: {e}")
-        traceback.print_exc(); sys.stdout.flush()
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="ดึงรูปจาก LINE ไม่สำเร็จ ลองใหม่อีกครั้งครับ")]
-            )
-        )
-        return
-
-    # เตรียมรูป (ย่อ + เข้ารหัส JPEG) ตาม flow
-    try:
-        if state == "waiting_for_checkin_images":
-            bio, ext, mime = prepare_image_for_checkin(data)
+        message_id = event.message.id
+        resp = blob_api.get_message_content(message_id)
+        if hasattr(resp, "iter_content"):
+            image_bytes = b"".join(chunk for chunk in resp.iter_content(chunk_size=1024))
+        elif hasattr(resp, "read"):
+            image_bytes = resp.read()
+        elif isinstance(resp, (bytes, bytearray)):
+            image_bytes = bytes(resp)
         else:
-            bio, ext, mime = prepare_image_for_submission(data)
+            image_bytes = bytes(resp)
     except Exception as e:
-        print(f"ERROR: prepare image failed: {e}")
+        print(f"ERROR: Unable to download image from LINE: {e}")
         traceback.print_exc(); sys.stdout.flush()
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="แปลงรูปภาพไม่สำเร็จ ลองถ่ายใหม่อีกครั้งครับ")]
-            )
-        )
+        _reply_or_push_messages(event, user_id, [
+            V3TextMessage(text="ดาวน์โหลดรูปจาก LINE ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง")
+        ])
         return
 
-    # อัปขึ้น Google Drive (ต้อง authorize ก่อน)
+    # ---- Decode & compress image (flow-specific quality) ----
+    is_submission_flow = (current_state == "waiting_for_submit_images")
+    try:
+        out_bio, ext, mime = (prepare_image_for_submission(image_bytes) if is_submission_flow
+                              else prepare_image_for_checkin(image_bytes))
+    except Exception as e:
+        print(f"ERROR: Pillow failed to process image: {e}")
+        traceback.print_exc(); sys.stdout.flush()
+        _reply_or_push_messages(event, user_id, [
+            V3TextMessage(text="ประมวลผลรูปภาพไม่สำเร็จ กรุณาลองส่งใหม่ (รองรับ JPEG/PNG/GIF)")
+        ])
+        return
+
+    # ---- Ensure Drive is authorized ----
     if drive_service is None:
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="ยังไม่ได้เชื่อมต่อ Google Drive กรุณาเปิด /authorize เพื่อเชื่อมต่อก่อนครับ")]
-            )
-        )
+        _reply_or_push_messages(event, user_id, [
+            V3TextMessage(text="ยังไม่ได้อนุญาตการอัปโหลด Google Drive กรุณาเปิดลิงก์ /authorize ในเบราว์เซอร์และยืนยันก่อนครับ")
+        ])
+        print("DEBUG: Drive not authorized; abort image handling."); sys.stdout.flush()
         return
 
-    # ตั้งชื่อไฟล์บน Drive
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname = f"{state}_{txn}_{ts}.{ext}"
-
-    media = MediaIoBaseUpload(bio, mimetype=mime, resumable=False)
-    file_meta = {
-        "name": fname,
-        "parents": [GOOGLE_DRIVE_FOLDER_ID] if GOOGLE_DRIVE_FOLDER_ID else []
-    }
-
+    # ---- Upload to Google Drive ----
     try:
-        gfile = drive_service.files().create(body=file_meta, media_body=media, fields="id, webViewLink").execute()
-        file_id = gfile.get("id")
+        prefix = "submission_image" if is_submission_flow else "checkin_image"
+        file_name = f"{prefix}_{current_transaction_id}_{uuid.uuid4()}.{ext}"
+        media = MediaIoBaseUpload(out_bio, mimetype=mime, resumable=True)
+        file_metadata = {"name": file_name}
+        if GOOGLE_DRIVE_FOLDER_ID:
+            file_metadata["parents"] = [GOOGLE_DRIVE_FOLDER_ID]
+
+        created = _exec_with_timeout(
+            lambda: drive_service.files().create(body=file_metadata, media_body=media, fields="id, webViewLink").execute(),
+            DRIVE_EXECUTE_TIMEOUT_SEC,
+            "Drive files.create"
+        )
+        file_id = created.get("id")
+        uploaded_url = created.get("webViewLink")
+
+        # Best-effort: make public
         try:
-            drive_service.permissions().create(
-                fileId=file_id,
-                body={"type": "anyone", "role": "reader"},
-                fields="id"
-            ).execute()
-        except Exception:
-            pass
-        image_url = gfile.get("webViewLink") or f"https://drive.google.com/file/d/{file_id}/view"
-    except Exception as e:
-        print(f"ERROR: drive upload failed: {e}")
-        traceback.print_exc(); sys.stdout.flush()
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="อัปโหลดรูปขึ้น Drive ไม่สำเร็จ กรุณาลองใหม่อีกครั้งครับ")]
+            _exec_with_timeout(
+                lambda: drive_service.permissions().create(fileId=file_id, body={"type": "anyone", "role": "reader"}).execute(),
+                DRIVE_EXECUTE_TIMEOUT_SEC,
+                "Drive permissions.create"
             )
-        )
+        except Exception as e:
+            print(f"WARNING: set public permission failed: {e}")
+            traceback.print_exc(); sys.stdout.flush()
+    except Exception as e:
+        print(f"ERROR: Drive upload failed: {e}")
+        traceback.print_exc(); sys.stdout.flush()
+        _reply_or_push_messages(event, user_id, [
+            V3TextMessage(text="อัปโหลดรูปไปยัง Drive ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง")
+        ])
         return
 
-    # เขียน URL ลงชีต
-    try:
-        if state == "waiting_for_checkin_images":
-            idx, filled = _update_checkins_add_image_url(txn, image_url)
+    # ---- Write to Sheets (idempotent, no duplicate append) ----
+    if not is_submission_flow:
+        # CHECK-IN flow
+        try:
+            idx, filled = _update_checkins_add_image_url(current_transaction_id, uploaded_url)
             remain = max(0, 3 - int(filled))
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[
-                        V3TextMessage(
-                            text=f"บันทึกรูปเช็คอินแล้ว ✓ ส่งได้อีก {remain} รูป (ส่งทีละ 1 รูป สูงสุด 3 รูป)",
-                            quick_reply=QuickReply(items=[
-                                QuickReplyItem(action=CameraAction(label="📸 ถ่ายภาพเช็คอิน")),
-                                QuickReplyItem(action=CameraRollAction(label="🖼 เลือกจากคลังภาพ")),
-                                QuickReplyItem(action=MessageAction(label="✅ จบการเช็คอิน", text="จบการเช็คอิน")),
-                            ])
-                        )
-                    ]
+            if remain == 0:
+                msg_text = "บันทึกรูปครบ 3 รูปแล้ว ✅\nพิมพ์ 'จบ' เพื่อปิดการเช็คอิน"
+            else:
+                msg_text = f"บันทึกรูปแล้ว ✅ เหลือส่งได้อีก {remain} รูป"
+
+            _reply_or_push_messages(event, user_id, [
+                V3TextMessage(
+                    text=msg_text,
+                    quick_reply=QuickReply(items=[
+                        QuickReplyItem(action=CameraAction(label="📸 ถ่ายภาพเช็คอิน")),
+                        QuickReplyItem(action=CameraRollAction(label="🖼 เลือกจากคลังภาพ")),
+                        QuickReplyItem(action=MessageAction(label="✅ จบการเช็คอิน", text="จบการเช็คอิน")),
+                    ])
                 )
-            )
+            ])
+        except Exception as e:
+            print(f"ERROR: update CheckIns with image failed: {e}")
+            traceback.print_exc(); sys.stdout.flush()
+            _reply_or_push_messages(event, user_id, [
+                V3TextMessage(text="บันทึกรูปในชีตไม่สำเร็จ กรุณาลองใหม่อีกครั้ง")
+            ])
             return
-        else:
-            # Submission flow — ถ้าคุณมีการคำนวณ hash ให้แทนค่า image_hash_hex ได้
-            image_hash_hex = ""
-            idx, filled, dup_note = _update_submissions_add_image_url(txn, image_url, image_hash_hex)
-           # Auto finalize when 3 images received for submission
+    else:
+        # SUBMISSION flow
+        try:
+            try:
+                image_hash_hex = _compute_image_ahash_from_jpeg_bytes(out_bio)
+            except Exception:
+                image_hash_hex = ""
+
+            idx, filled, dup_note = _update_submissions_add_image_url(
+                current_transaction_id,
+                uploaded_url,
+                image_hash_hex
+            )
+            dup_note = None
+            
+
+            # --- 2.2 Auto-finalize: ครบ 3 รูป → ปิดงาน ---
             if filled >= 3:
-                _finalize_submission(user_id, txn, "done")
-                _reply_or_push_messages(event, user_id, [
-                    V3TextMessage(text="ส่งงานเรียบร้อย ✅ รับภาพครบ 3 ภาพแล้ว ระบบปิดงานให้อัตโนมัติ")
-                ])
-                return
-            remain = max(0, 3 - int(filled))
-            suffix = f"\n(พบซ้ำ: {dup_note})" if dup_note else ""
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[
-                        V3TextMessage(
-                            text=f"บันทึกรูปงานแล้ว ✓ ส่งได้อีก {remain} รูป (ส่งทีละ 1 รูป สูงสุด 3 รูป){suffix}",
-                            quick_reply=QuickReply(items=[
-                                QuickReplyItem(action=CameraAction(label="📸 ถ่ายรูปงาน")),
-                                QuickReplyItem(action=CameraRollAction(label="🖼 เลือกจากคลังภาพ")),
-                                QuickReplyItem(action=MessageAction(label="✅ จบการส่งงาน", text="จบการส่งงาน")),
-                            ])
-                        )
-                    ]
+                try:
+                    _finalize_submission(user_id, current_transaction_id, "done")
+                except Exception as e:
+                    print(f"WARNING: auto-finalize after 3 images failed: {e}")
+                    traceback.print_exc()
+                    sys.stdout.flush()
+                _reply_or_push_messages(
+                    event,
+                    user_id,
+                    [V3TextMessage(text="ส่งงานเรียบร้อย ✅ ได้รับรูปครบ 3 รูปแล้ว")]
                 )
-            )
+                print(f"DEBUG: Auto-finalized submission {current_transaction_id} after 3 images.")
+                sys.stdout.flush()
+                return
+
+            # ยังไม่ครบ 3 → แจ้งจำนวนที่เหลือเสมอ
+            remain = max(0, 3 - int(filled))
+            base_text = f"บันทึกรูปงานแล้ว ✅ เหลือส่งได้อีก {remain} รูป"
+            if dup_note:
+                base_text += f"\n(พบรูปซ้ำกับ {dup_note})"
+
+            _reply_or_push_messages(event, user_id, [
+                V3TextMessage(
+                    text=base_text,
+                    quick_reply=QuickReply(items=[
+                        QuickReplyItem(action=CameraAction(label="📸 ถ่ายรูปงาน")),
+                        QuickReplyItem(action=CameraRollAction(label="🖼 เลือกจากคลังภาพ")),
+                        QuickReplyItem(action=MessageAction(label="✅ จบการส่งงาน", text="จบการส่งงาน")),
+                    ])
+                )
+            ])
+        except Exception as e:
+            print(f"ERROR: update Submissions with image failed: {e}")
+            traceback.print_exc(); sys.stdout.flush()
+            _reply_or_push_messages(event, user_id, [
+                V3TextMessage(text="บันทึกรูปงานในชีตไม่สำเร็จ กรุณาลองใหม่อีกครั้ง")
+            ])
             return
-    except Exception as e:
-        print(f"ERROR: update sheet with image url failed: {e}")
-        traceback.print_exc(); sys.stdout.flush()
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="บันทึกรูปลงชีตไม่สำเร็จ กรุณาลองใหม่อีกครั้งครับ")]
-            )
-        )
-        return
 
 # --- FR-005 helpers: image duplicate detection for Submissions only ---
 def _compute_image_ahash_from_jpeg_bytes(jpeg_bio: io.BytesIO) -> str:
@@ -2307,723 +2350,6 @@ def _reply_after_image(user_reply_token, filled_count: int, flow: str):
             messages=[msg]
         )
     )
-
-
-@handler.add(MessageEvent, message=ImageMessageContent)
-def handle_image_message(event):
-    # Ensure services
-    ensure_google_services()
-
-    user_id = event.source.user_id
-    # De-dup guard for LINE redelivery
-    evt_id = getattr(event, "webhook_event_id", None) or getattr(event.message, "id", None)
-    if evt_id and evt_id in _processed_events:
-        print(f"DEBUG: Duplicate image event ignored: {evt_id}")
-        sys.stdout.flush()
-        return
-    if evt_id:
-        _processed_events.add(evt_id)
-
-    # Read employee context once
-    employee_data, _ = get_employee_data(user_id)
-    if employee_data == "__SHEETS_ERROR__":
-        _reply_or_push_messages(event, user_id, [
-            V3TextMessage(text="ตอนนี้เชื่อมต่อชีตไม่สำเร็จ กรุณาส่งรูปอีกครั้งภายหลังสักครู่")
-        ])
-        print("DEBUG: Image path aborted due to Sheets error."); sys.stdout.flush()
-        return
-
-    if not employee_data:
-        _reply_or_push_messages(event, user_id, [
-            V3TextMessage(text="กรุณาลงทะเบียนก่อนใช้งานฟังก์ชันนี้")
-        ])
-        print("DEBUG: Replied: not registered (Image)."); sys.stdout.flush()
-        return
-
-    current_state = employee_data[EMPLOYEE_CURRENT_STATE_COL] if len(employee_data) > EMPLOYEE_CURRENT_STATE_COL else "idle"
-    current_transaction_id = employee_data[EMPLOYEE_CURRENT_TRANSACTION_ID_COL] if len(employee_data) > EMPLOYEE_CURRENT_TRANSACTION_ID_COL else ""
-
-    # Auto-timeout check before processing new image
-    if _check_and_handle_timeout(user_id, reply_token=event.reply_token):
-        return
-
-    if not employee_data:
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="กรุณาลงทะเบียนก่อนใช้งานฟังก์ชันนี้")]
-            )
-        )
-        print("DEBUG: Replied: not registered (Image)."); sys.stdout.flush()
-        return
-
-    if current_state not in ("waiting_for_checkin_images", "waiting_for_submit_images") or not current_transaction_id:
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="กรุณาเริ่มขั้นตอนให้ถูกต้องก่อน (เช็คอินหรือส่งงาน) แล้วจึงส่งรูปครับ")]
-            )
-        )
-        print("DEBUG: Replied: image received but not in waiting-for-images state."); sys.stdout.flush()
-        return
-
-    # --- Fetch image bytes from LINE ---
-    try:
-        message_id = event.message.id
-        resp = blob_api.get_message_content(message_id)
-        if hasattr(resp, "iter_content"):
-            image_bytes = b"".join(chunk for chunk in resp.iter_content(chunk_size=1024))
-        elif isinstance(resp, (bytes, bytearray)):
-            image_bytes = bytes(resp)
-        elif hasattr(resp, "read"):
-            image_bytes = resp.read()
-        else:
-            image_bytes = bytes(resp)
-    except Exception as e:
-        print(f"ERROR: Unable to download image from LINE: {e}")
-        traceback.print_exc(); sys.stdout.flush()
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="ดาวน์โหลดรูปจาก LINE ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง")]
-            )
-        )
-        return
-
-    # --- Decode & compress image ---
-    is_submission_flow = (current_state == "waiting_for_submit_images")
-    try:
-        out_bio, ext, mime = (prepare_image_for_submission(image_bytes) if is_submission_flow else prepare_image_for_checkin(image_bytes))
-    except Exception as e:
-        print(f"ERROR: Pillow failed to process image: {e}")
-        traceback.print_exc(); sys.stdout.flush()
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="ประมวลผลรูปภาพไม่สำเร็จ กรุณาลองส่งใหม่ (รองรับ JPEG/PNG/GIF)")]
-            )
-        )
-        return
-
-    file_prefix = "submission_image" if is_submission_flow else "checkin_image"
-    file_name = f"{file_prefix}_{current_transaction_id}_{uuid.uuid4()}.{ext}"
-
-    # --- Ensure Drive is authorized ---
-    if drive_service is None:
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="ยังไม่ได้อนุญาตการอัปโหลด Google Drive กรุณาเปิดลิงก์ /authorize ในเบราว์เซอร์และยืนยันก่อนครับ")]
-            )
-        )
-        print("DEBUG: Drive not authorized; abort image handling."); sys.stdout.flush()
-        return
-
-    # --- Upload to Drive ---
-    try:
-        media = MediaIoBaseUpload(out_bio, mimetype=mime, resumable=True)
-        file_metadata = {"name": file_name, "parents": [GOOGLE_DRIVE_FOLDER_ID]} if GOOGLE_DRIVE_FOLDER_ID else {"name": file_name}
-        created = _exec_with_timeout(
-            lambda: drive_service.files().create(body=file_metadata, media_body=media, fields="id, webViewLink").execute(),
-            DRIVE_EXECUTE_TIMEOUT_SEC,
-            "Drive files.create"
-        )
-        file_id = created.get("id")
-        uploaded_url = created.get("webViewLink")
-
-        # Public permission (ไม่ critical ถ้าล้มเหลว)
-        try:
-            _exec_with_timeout(
-                lambda: drive_service.permissions().create(fileId=file_id, body={"type": "anyone", "role": "reader"}).execute(),
-                DRIVE_EXECUTE_TIMEOUT_SEC,
-                "Drive permissions.create"
-            )
-        except Exception as e:
-            print(f"WARNING: set public permission failed: {e}"); traceback.print_exc(); sys.stdout.flush()
-    except Exception as e:
-        print(f"ERROR: Drive upload failed: {e}")
-        traceback.print_exc(); sys.stdout.flush()
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="อัปโหลดรูปไปยัง Drive ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง")]
-            )
-        )
-        return
-
-    # --- Write to Sheets (NO duplicate append) ---
-    if not is_submission_flow:
-        # CHECK-IN: ใช้ตัวช่วย idempotent
-        try:
-            idx, filled = _update_checkins_add_image_url(current_transaction_id, uploaded_url)
-            if filled >= 3:
-                msg = "บันทึกรูปครบ 3 รูปแล้ว ✅\nพิมพ์ 'จบ' เพื่อปิดการเช็คอิน"
-            else:
-                remain = 3 - filled
-                msg = f"บันทึกรูปแล้ว ✅ เหลือส่งได้อีก {remain} รูป"
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[
-                        V3TextMessage(
-                            text=msg,
-                            quick_reply=QuickReply(items=[
-                                QuickReplyItem(action=CameraAction(label="📸 ถ่ายภาพเช็คอิน")),
-                                QuickReplyItem(action=CameraRollAction(label="🖼 เลือกจากคลังภาพ")),
-                                QuickReplyItem(action=MessageAction(label="✅ จบการเช็คอิน", text="จบการเช็คอิน")),
-                            ])
-                        )
-                    ]
-                )
-            )
-        except Exception as e:
-            print(f"ERROR: update CheckIns with image failed: {e}")
-            traceback.print_exc(); sys.stdout.flush()
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[V3TextMessage(text="บันทึกรูปในชีตไม่สำเร็จ กรุณาลองใหม่อีกครั้ง")]
-                )
-            )
-            return
-    else:
-        # SUBMISSION: เก็บแฮช และตรวจซ้ำ (ไม่แจ้ง user ตาม requirement)
-        try:
-            try:
-                image_hash_hex = _compute_image_ahash_from_jpeg_bytes(out_bio)
-            except Exception:
-                image_hash_hex = ""
-            idx, filled, dup_note = _update_submissions_add_image_url(current_transaction_id, uploaded_url, image_hash_hex)
-            if filled >= 3:
-                msg = "บันทึกรูปงานครบ 3 รูปแล้ว ✅\nพิมพ์ 'จบ' เพื่อปิดการส่งงาน"
-            else:
-                remain = 3 - filled
-                msg = f"บันทึกรูปงานแล้ว ✅ เหลือส่งได้อีก {remain} รูป"
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[
-                        V3TextMessage(
-                            text=msg,
-                            quick_reply=QuickReply(items=[
-                                QuickReplyItem(action=CameraAction(label="📸 ถ่ายรูปงาน")),
-                                QuickReplyItem(action=CameraRollAction(label="🖼 เลือกจากคลังภาพ")),
-                                QuickReplyItem(action=MessageAction(label="✅ จบการส่งงาน", text="จบการส่งงาน")),
-                            ])
-                        )
-                    ]
-                )
-            )
-        except Exception as e:
-            print(f"ERROR: update Submissions with image failed: {e}")
-            traceback.print_exc(); sys.stdout.flush()
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[V3TextMessage(text="บันทึกรูปงานในชีตไม่สำเร็จ กรุณาลองใหม่อีกครั้ง")]
-                )
-            )
-            return
-        
-    # Auto-timeout check before processing new image
-    if _check_and_handle_timeout(user_id, reply_token=event.reply_token):
-        return
-
-    if not employee_data:
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="กรุณาลงทะเบียนก่อนใช้งานฟังก์ชันนี้")]
-            )
-        )
-        print("DEBUG: Replied: not registered (Image).")
-        sys.stdout.flush()
-        return
-
-    if current_state not in ("waiting_for_checkin_images", "waiting_for_submit_images") or not current_transaction_id:
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="กรุณาเริ่มขั้นตอนให้ถูกต้องก่อน (เช็คอินหรือส่งงาน) แล้วจึงส่งรูปครับ")]
-            )
-        )
-        print("DEBUG: Replied: image received but not in waiting-for-images state."); sys.stdout.flush();
-        return
-
-    # --- Fetch image bytes from LINE ---
-    try:
-        message_id = event.message.id  # <-- valid only for ImageMessageContent
-        resp = blob_api.get_message_content(message_id)
-        if hasattr(resp, "iter_content"):
-            image_bytes = b"".join(chunk for chunk in resp.iter_content(chunk_size=1024))
-        elif isinstance(resp, (bytes, bytearray)):
-            image_bytes = bytes(resp)
-        elif hasattr(resp, "read"):
-            image_bytes = resp.read()
-        else:
-            image_bytes = bytes(resp)
-    except Exception as e:
-        print(f"ERROR: Unable to download image from LINE: {e}")
-        traceback.print_exc()
-        sys.stdout.flush()
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="ดาวน์โหลดรูปจาก LINE ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง")]
-            )
-        )
-        return
-
-    # --- Decode & compress image with Pillow (resize + JPEG re-encode) ---
-    is_submission_flow = (current_state == "waiting_for_submit_images")
-    try:
-        out_bio, ext, mime = (prepare_image_for_submission(image_bytes) if is_submission_flow else prepare_image_for_checkin(image_bytes))
-    except Exception as e:
-        print(f"ERROR: Pillow failed to process image: {e}")
-        traceback.print_exc()
-        sys.stdout.flush()
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="ประมวลผลรูปภาพไม่สำเร็จ กรุณาลองส่งใหม่ (รองรับ JPEG/PNG/GIF)")]
-            )
-        )
-        return
-
-    file_prefix = "submission_image" if is_submission_flow else "checkin_image"
-    file_name = f"{file_prefix}_{current_transaction_id}_{uuid.uuid4()}.{ext}"
-
-    # --- Ensure Drive is authorized ---
-    if drive_service is None:
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="ยังไม่ได้เชื่อมต่อ Google Drive กรุณาเปิด /authorize ในเบราว์เซอร์ก่อนครับ")]
-            )
-        )
-        print("ERROR: Drive service is None. Ask user to authorize via /authorize.")
-        sys.stdout.flush()
-        return
-
-    # --- Upload to Drive ---
-    try:
-        if not GOOGLE_DRIVE_FOLDER_ID:
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[V3TextMessage(text="ยังไม่ได้ตั้งค่าโฟลเดอร์ปลายทางใน Google Drive (GOOGLE_DRIVE_FOLDER_ID). กรุณาตั้งค่าใน .env แล้วเริ่มใหม่ครับ")]
-                )
-            )
-            print("ERROR: GOOGLE_DRIVE_FOLDER_ID is not set; cannot upload.")
-            sys.stdout.flush()
-            return
-
-        media = MediaIoBaseUpload(out_bio, mimetype=mime, resumable=False)
-        file_metadata = {'name': file_name, 'parents': [GOOGLE_DRIVE_FOLDER_ID]}
-
-        create_req = drive_service.files().create(
-        body=file_metadata, media_body=media, fields='id,webViewLink', supportsAllDrives=True
-        )
-        uploaded = _exec_with_timeout(lambda: create_req.execute(num_retries=3),
-                              DRIVE_EXECUTE_TIMEOUT_SEC,
-                              "Drive files.create")
-        image_url = uploaded.get('webViewLink')
-        print(f"DEBUG: Image uploaded to Drive: {image_url}")
-        sys.stdout.flush()
-
-        # Try to set public permission (ignore failure)
-        try:
-            perm_req = drive_service.permissions().create(
-                fileId=uploaded['id'], body={'type': 'anyone', 'role': 'reader'}, supportsAllDrives=True
-            )
-            _ = _exec_with_timeout(lambda: perm_req.execute(num_retries=3),
-                                DRIVE_EXECUTE_TIMEOUT_SEC,
-                                "Drive permissions.create")
-            print("DEBUG: Image permission set to public.")
-        except Exception as pe:
-            print(f"WARNING: set public permission failed: {pe}")
-            traceback.print_exc()
-            sys.stdout.flush()
-
-    except Exception as e:
-        print(f"ERROR: Upload to Drive failed: {e}")
-        traceback.print_exc()
-        sys.stdout.flush()
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="อัปโหลดรูปไป Google Drive ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง")]
-            )
-        )
-        return
-
-    # --- Update Submissions sheet (FR-005: store hash and duplicate reference) ---
-    if is_submission_flow:
-        try:
-            # 1) Compute aHash from the processed JPEG bytes
-            img_hash = _compute_image_ahash_from_jpeg_bytes(out_bio)
-
-            # 2) Lookup duplicate in previous submissions (if any)
-            dup_submit_id, dup_row_idx, dup_slot = _find_duplicate_in_submissions(img_hash, current_transaction_id)
-
-            # 3) Load current submission row and fill next empty slot(s)
-            sub_row, sub_idx = _find_submissions_row_by_id(current_transaction_id)
-            if not sub_idx:
-                # If row missing due to timing, upsert minimally then re-read
-                upsert_submission_row_idempotent(current_transaction_id, user_id, "", "", 0)
-                sub_row, sub_idx = _find_submissions_row_by_id(current_transaction_id)
-
-            # Ensure we can write up to R (index 17)
-            if not sub_row:
-                sub_row = []
-            _ensure_row_len(sub_row, 18)  # A..R
-
-            # Find next empty image slot (F..H => idx 5..7)
-            target_img_col = None
-            for j in range(5, 8):
-                if j >= len(sub_row) or not sub_row[j]:
-                    target_img_col = j
-                    break
-            if target_img_col is None:
-                # Already 3 images; keep last_updated_at and reply, do not overwrite
-                sub_row[8] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                update_sheet_data(SUBMISSIONS_SHEET_NAME, f"{SUBMISSIONS_SHEET_NAME}!A{sub_idx}:R{sub_idx}", sub_row)
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[V3TextMessage(text="ได้รับรูปครบ 3 รูปแล้ว ✅ หากต้องการจบ พิมพ์ 'จบการส่งงาน'")]
-                    )
-                )
-                return
-
-            # Map image slot F/G/H to hash columns M/N/O and duplicate refs P/Q/R
-            img_slot = (target_img_col - 4)  # 1..3
-            hash_col = 11 + img_slot         # M..O => 12..14 (0-based index)
-            dup_col  = 14 + img_slot         # P..R => 15..17 (0-based index)
-
-            # Write URL
-            sub_row[target_img_col] = image_url
-            # Write hash
-            _ensure_row_len(sub_row, max(18, hash_col + 1))
-            sub_row[hash_col] = img_hash or ""
-            # Write duplicate reference if found (format: submitId#slot@row)
-            if dup_submit_id:
-                _ensure_row_len(sub_row, max(18, dup_col + 1))
-                sub_row[dup_col] = f"{dup_submit_id}#{dup_slot}@row{dup_row_idx}"
-
-            # Update timestamps/status
-            sub_row[8] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            if len(sub_row) > 9 and not sub_row[9]:
-                sub_row[9] = "in_progress"
-
-            update_sheet_data(SUBMISSIONS_SHEET_NAME, f"{SUBMISSIONS_SHEET_NAME}!A{sub_idx}:R{sub_idx}", sub_row)
-
-            # Count filled images and auto-finalize when complete
-            filled_count = sum(1 for j in range(5, 8) if j < len(sub_row) and sub_row[j])
-            left = max(0, 3 - filled_count)
-            if left == 0:
-                _finalize_submission(user_id, current_transaction_id, "done")
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[V3TextMessage(text="บันทึกรูปงานครบถ้วนแล้ว ✅ ระบบปิดการส่งงานให้เรียบร้อย")]
-                    )
-                )
-            else:
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[
-                            V3TextMessage(
-                                text=f"บันทึกรูปงานแล้ว ✓ ขณะนี้มี {filled_count}/3 รูป (ส่งได้อีก {left} รูป)",
-                                quick_reply=QuickReply(items=[
-                                    QuickReplyItem(action=CameraAction(label="📸 ถ่ายรูปงาน")),
-                                    QuickReplyItem(action=CameraRollAction(label="🖼 เลือกจากคลังภาพ")),
-                                    QuickReplyItem(action=MessageAction(label="✅ จบการส่งงาน", text="จบการส่งงาน")),
-                                ])
-                            )
-                        ]
-                    )
-                )
-            return
-
-        except Exception as e:
-            print(f"ERROR: update Submissions (hash/dup) failed: {e}")
-            traceback.print_exc(); sys.stdout.flush()
-            # Fallback to simple URL append only (no hash/dup)
-            try:
-                sub_row, sub_idx = _find_submissions_row_by_id(current_transaction_id)
-                if not sub_idx:
-                    upsert_submission_row_idempotent(current_transaction_id, user_id, "", "", 0)
-                    sub_row, sub_idx = _find_submissions_row_by_id(current_transaction_id)
-                if not sub_row:
-                    sub_row = []
-                _ensure_row_len(sub_row, 12)
-                # next empty F..H
-                tgt = None
-                for j in range(5, 8):
-                    if j >= len(sub_row) or not sub_row[j]:
-                        tgt = j; break
-                if tgt is not None:
-                    sub_row[tgt] = image_url
-                sub_row[8] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                if len(sub_row) > 9 and not sub_row[9]:
-                    sub_row[9] = "in_progress"
-                update_sheet_data(SUBMISSIONS_SHEET_NAME, f"{SUBMISSIONS_SHEET_NAME}!A{sub_idx}:L{sub_idx}", sub_row[:12])
-                # After fallback write, count images and auto-finalize if complete
-                images_present = sum(1 for j in range(5, 8) if j < len(sub_row) and sub_row[j])
-                left = max(0, 3 - images_present)
-                if left == 0:
-                    _finalize_submission(user_id, current_transaction_id, "done")
-                    line_bot_api.reply_message(
-                        ReplyMessageRequest(
-                            reply_token=event.reply_token,
-                            messages=[V3TextMessage(text="บันทึกรูปงานครบถ้วนแล้ว ✅ ระบบปิดการส่งงานให้เรียบร้อย")]
-                        )
-                    )
-                else:
-                    line_bot_api.reply_message(
-                        ReplyMessageRequest(
-                            reply_token=event.reply_token,
-                            messages=[
-                                V3TextMessage(
-                                    text=f"บันทึกรูปงานแล้ว ✓ ขณะนี้มี {images_present}/3 รูป (ส่งได้อีก {left} รูป)",
-                                    quick_reply=QuickReply(items=[
-                                        QuickReplyItem(action=CameraAction(label="📸 ถ่ายรูปงานเพิ่ม")),
-                                        QuickReplyItem(action=CameraRollAction(label="🖼 เลือกจากคลังภาพ")),
-                                        QuickReplyItem(action=MessageAction(label="✅ จบการส่งงาน", text="จบการส่งงาน")),
-                                    ])
-                                )
-                            ]
-                        )
-                    )
-                return
-            except Exception as e2:
-                print(f"ERROR: Submissions simple fallback failed: {e2}")
-                traceback.print_exc(); sys.stdout.flush()
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[V3TextMessage(text="บันทึกรูปงานไม่สำเร็จ กรุณาลองใหม่อีกครั้ง")]
-                    )
-                )
-                return
-
-    # --- Update CheckIns sheet (fill image_url_1..3) ---
-    if not is_submission_flow:
-        try:
-            # Prefer LINE's imageSet.index if provided (1-based). Fallback to "next empty slot".
-            image_set = getattr(event.message, "image_set", None) or getattr(event.message, "imageSet", None)
-            target_slot_idx = None  # 0-based sheet column index j (5..7 → F..H)
-            if image_set and hasattr(image_set, "index"):
-                try:
-                    idx_val = int(image_set.index)
-                    if idx_val in (1, 2, 3):
-                        target_slot_idx = 4 + idx_val  # 1→5(F), 2→6(G), 3→7(H)
-                except Exception:
-                    target_slot_idx = None  # ignore parsing errors
-            # Use a per-transaction lock to prevent conflicting concurrent updates
-            lock = _txn_locks[current_transaction_id]
-            with lock:
-                checkins_data = get_sheet_data("CheckIns")
-                row_idx_1based = None
-                row = None
-                for i, r in enumerate(checkins_data):
-                    if r and len(r) > 0 and r[0] == current_transaction_id:
-                        row = r
-                        row_idx_1based = i + 1
-                        break
-                if row is None or row_idx_1based is None:
-                    line_bot_api.reply_message(
-                        ReplyMessageRequest(
-                            reply_token=event.reply_token,
-                            messages=[V3TextMessage(text="ไม่พบข้อมูลเช็คอินล่าสุดในชีต กรุณาเริ่มเช็คอินใหม่อีกครั้ง")]
-                        )
-                    )
-                    print("ERROR: CheckIns row for current transaction not found.")
-                    sys.stdout.flush()
-                    return
-                _ensure_row_len(row, 12)  # A..L
-                if target_slot_idx is not None:
-                    j = target_slot_idx
-                    if j < len(row) and row[j]:
-                        j = None
-                        for cand in range(5, 8):
-                            if not (cand < len(row) and row[cand]):
-                                j = cand
-                                break
-                        if j is None:
-                            pass
-                else:
-                    j = None
-                    for cand in range(5, 8):
-                        if not (cand < len(row) and row[cand]):
-                            j = cand
-                            break
-                if j is not None:
-                    while len(row) <= j:
-                        row.append("")
-                    row[j] = image_url
-                row[8] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # I
-                row[9] = "in_progress"  # J
-                if len(row) > 10:
-                    row[10] = ""  # K: warning_sent
-                images_now = 0
-                for cand in range(5, 8):
-                    if cand < len(row) and row[cand]:
-                        images_now += 1
-                update_sheet_data("CheckIns", f"CheckIns!A{row_idx_1based}:L{row_idx_1based}", row)
-            if images_now >= 3:
-                _finalize_checkin(user_id, current_transaction_id, "done")
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[V3TextMessage(text="บันทึกรูปภาพหลักฐานครบถ้วนแล้ว ✅ ระบบปิดเช็คอินให้เรียบร้อย")]
-                    )
-                )
-                print("DEBUG: Replied: complete 3 images → finalize done.")
-            else:
-                remaining = 3 - images_now
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[
-                            V3TextMessage(
-                                text=f"บันทึกรูปภาพเรียบร้อยแล้ว ✅\nสามารถส่งภาพได้เพิ่มอีก {remaining} รูป (ส่งครั้งละ 1 รูป)\nหากต้องการจบการเช็คอินให้กด “จบการเช็คอิน”",
-                                quick_reply=QuickReply(items=[
-                                    QuickReplyItem(action=CameraAction(label="📸 ส่งภาพเพิ่ม")),
-                                    QuickReplyItem(action=CameraRollAction(label="🖼 เลือกจากคลังภาพ")),
-                                    QuickReplyItem(action=MessageAction(label="✅ จบการเช็คอิน", text="จบการเช็คอิน")),
-                                ]),
-                            )
-                        ]
-                    )
-                )
-                print(f"DEBUG: Replied: image saved; waiting for more images (remaining={remaining}).")
-            sys.stdout.flush()
-        except Exception as e:
-            print(f"ERROR: Updating CheckIns failed: {e}")
-            traceback.print_exc()
-            sys.stdout.flush()
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[V3TextMessage(text="บันทึกลิงก์รูปลงชีตไม่สำเร็จ กรุณาลองใหม่อีกครั้ง")]
-                )
-            )
-            return
-    else:
-        # Submission flow: update Submissions sheet
-        try:
-            lock = _txn_locks[current_transaction_id]
-            with lock:
-                subs_data = get_sheet_data(SUBMISSIONS_SHEET_NAME)
-                row_idx_1based = None
-                row = None
-                for i, r in enumerate(subs_data or []):
-                    if r and len(r) > 0 and r[0] == current_transaction_id:
-                        row = r
-                        row_idx_1based = i + 1
-                        break
-                if row is None or row_idx_1based is None:
-                    line_bot_api.reply_message(
-                        ReplyMessageRequest(
-                            reply_token=event.reply_token,
-                            messages=[V3TextMessage(text="ไม่พบข้อมูลการส่งงานล่าสุดในชีต กรุณาเริ่มใหม่อีกครั้ง")]
-                        )
-                    )
-                    print("ERROR: Submissions row for current transaction not found.")
-                    sys.stdout.flush()
-                    return
-
-                _ensure_row_len(row, 12)  # A..L (0..11)
-
-                # honor image set index if provided, else first empty slot F..H (5..7)
-                image_set = getattr(event.message, "image_set", None) or getattr(event.message, "imageSet", None)
-                target_slot_idx = None
-                if image_set and hasattr(image_set, "index"):
-                    try:
-                        idx_val = int(image_set.index)
-                        if idx_val in (1, 2, 3):
-                            target_slot_idx = 4 + idx_val  # map to F..H (5..7)
-                    except Exception:
-                        target_slot_idx = None
-
-                if target_slot_idx is not None:
-                    j = target_slot_idx
-                    if j < len(row) and row[j]:
-                        j = None
-                        for cand in range(5, 8):
-                            if not (cand < len(row) and row[cand]):
-                                j = cand
-                                break
-                else:
-                    j = None
-                    for cand in range(5, 8):
-                        if not (cand < len(row) and row[cand]):
-                            j = cand
-                            break
-
-                if j is not None:
-                    while len(row) <= j:
-                        row.append("")
-                    row[j] = image_url
-
-                # mark progress + refresh timestamp
-                row[8] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # I: last_updated_at
-                row[9] = "in_progress"  # J: status
-                update_sheet_data(SUBMISSIONS_SHEET_NAME, f"{SUBMISSIONS_SHEET_NAME}!A{row_idx_1based}:L{row_idx_1based}", row)
-
-                # count images now
-                images_now = 0
-                for cand in range(5, 8):  # F..H
-                    if cand < len(row) and row[cand]:
-                        images_now += 1
-
-            # outside lock: finalize or ask for more
-            if images_now >= 3:
-                _finalize_submission(user_id, current_transaction_id, "done")
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[V3TextMessage(text="บันทึกรูปงานครบถ้วนแล้ว ✅ ระบบปิดการส่งงานให้เรียบร้อย")]
-                    )
-                )
-                print("DEBUG: Submission complete with 3 images → finalize.")
-                sys.stdout.flush()
-            else:
-                remaining = 3 - images_now
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[
-                            V3TextMessage(
-                                text=f"บันทึกรูปงานแล้ว ✅ ยังสามารถส่งรูปได้อีก {remaining} รูป (ครั้งละ 1 รูป)\nหากต้องการจบให้กด “จบการส่งงาน”",
-                                quick_reply=QuickReply(items=[
-                                    QuickReplyItem(action=CameraAction(label="📸 ส่งรูปเพิ่ม")),
-                                    QuickReplyItem(action=CameraRollAction(label="🖼 เลือกจากคลังภาพ")),
-                                    QuickReplyItem(action=MessageAction(label="✅ จบการส่งงาน", text="จบการส่งงาน")),
-                                ]),
-                            )
-                        ]
-                    )
-                )
-                print(f"DEBUG: Submission image saved; waiting for more (remaining={remaining}).")
-                sys.stdout.flush()
-            return
-        except Exception as e:
-            print(f"ERROR: Updating Submissions failed: {e}")
-            traceback.print_exc()
-            sys.stdout.flush()
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[V3TextMessage(text="บันทึกรูปส่งงานลงชีตไม่สำเร็จ กรุณาลองใหม่อีกครั้ง")]
-                )
-            )
-            return
-# --- END OF FLASK ROUTES AND HANDLERS ---
-
 
 # --- Startup: Run Flask app and scheduler if this is the main module ---
 
